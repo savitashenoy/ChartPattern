@@ -11,13 +11,30 @@ import yfinance as yf
 from flask import Flask, Response, jsonify, render_template, request
 
 
+# ── Path resolution ──────────────────────────────────────────────────────────
+# On Vercel, __file__ is inside /var/task/api/index.py.
+# The project root (and ScannerData.xlsx) is one level up.
+# We also try the same directory as a fallback, so placing the xlsx inside
+# the api/ folder works too.
 BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_FILE = BASE_DIR / "ScannerData.xlsx"
+_XLSX_CANDIDATES = [
+    BASE_DIR / "ScannerData.xlsx",
+    Path(__file__).resolve().parent / "ScannerData.xlsx",
+]
+DATA_FILE = next((p for p in _XLSX_CANDIDATES if p.exists()), _XLSX_CANDIDATES[0])
 
-app = Flask(__name__, template_folder=str(BASE_DIR / "templates"))
+# ── Flask app ─────────────────────────────────────────────────────────────────
+# template_folder must be an absolute path; Vercel's CWD can differ from
+# the source tree location, so we resolve it from __file__.
+TEMPLATE_DIR = BASE_DIR / "templates"
+app = Flask(__name__, template_folder=str(TEMPLATE_DIR))
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "quant_scanner_dev_secret")
 
-scan_tasks = {}
+# ── In-memory task store ──────────────────────────────────────────────────────
+# NOTE: Vercel serverless functions are stateless – a new instance may handle
+# the /api/export call, making scan_tasks empty.  The export endpoint now
+# accepts an inline `rows` payload from the client so it degrades gracefully.
+scan_tasks: dict = {}
 TASK_TTL_SECONDS = int(os.environ.get("SCAN_TASK_TTL_SECONDS", "3600"))
 
 DEFAULT_SCAN_CONFIG = {
@@ -54,7 +71,10 @@ def cleanup_tasks():
 
 def workbook():
     if not DATA_FILE.exists():
-        raise FileNotFoundError(f"Scanner workbook not found: {DATA_FILE.name}")
+        raise FileNotFoundError(
+            f"Scanner workbook not found at {DATA_FILE}. "
+            "Make sure ScannerData.xlsx is committed to the repository root."
+        )
     return pd.ExcelFile(DATA_FILE)
 
 
@@ -321,7 +341,8 @@ def analyze_ticker(ticker, df, config):
 def scan_tickers(tickers, config):
     results = []
     failures = []
-    chunk_size = 80
+    # Keep chunks small on Vercel to stay within the 60s function timeout
+    chunk_size = 20
 
     for start in range(0, len(tickers), chunk_size):
         chunk = tickers[start : start + chunk_size]
@@ -356,6 +377,8 @@ def scan_tickers(tickers, config):
     return results, failures
 
 
+# ── Routes ────────────────────────────────────────────────────────────────────
+
 @app.route("/")
 def index():
     return render_template("index.html", defaults=DEFAULT_SCAN_CONFIG)
@@ -369,6 +392,8 @@ def api_sheets():
         for name in sheet_names():
             sheets.append({"name": name, "count": len(load_tickers(name))})
         return jsonify({"sheets": sheets, "defaults": DEFAULT_SCAN_CONFIG})
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 500
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
@@ -410,19 +435,33 @@ def api_scan():
                 "elapsed_seconds": round(time.time() - started, 2),
             }
         )
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 500
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
 
 @app.route("/api/export/<task_id>", methods=["POST"])
 def api_export(task_id):
-    cleanup_tasks()
-    task = scan_tasks.get(task_id)
-    if not task:
-        return jsonify({"error": "Scan result expired or was not found."}), 404
+    """
+    Export scan results as CSV.
 
+    Because Vercel is stateless, scan_tasks may be empty on this instance.
+    The client should POST the rows it wants exported in the request body:
+        { "rows": [ ... ] }
+    If the task is found in memory, its results are used as a fallback.
+    """
+    cleanup_tasks()
     payload = request.get_json(silent=True) or {}
-    rows = payload.get("rows") or task.get("results", [])
+    rows = payload.get("rows")
+
+    if not rows:
+        # Fallback: try in-memory task (only works if same instance)
+        task = scan_tasks.get(task_id)
+        if task:
+            rows = task.get("results", [])
+        else:
+            return jsonify({"error": "Scan result not found. Please re-run the scan and export immediately."}), 404
 
     si = io.StringIO()
     writer = csv.writer(si)
@@ -440,7 +479,9 @@ def api_export(task_id):
             ]
         )
 
-    task["updated_at"] = time.time()
+    if task_id in scan_tasks:
+        scan_tasks[task_id]["updated_at"] = time.time()
+
     filename = f"quant_scan_{task_id[:8]}_filtered.csv"
     return Response(
         si.getvalue(),
